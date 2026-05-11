@@ -1,20 +1,21 @@
 import pandas as pd
 
-# Load dataset
-df = pd.read_csv("gesture_data.csv")
+# Load dataset (no headers)
+df = pd.read_csv("gesture_data.csv", header=None)
+
+# Assign column names manually
+df.columns = ["Ax", "Ay", "Az", "Gx", "Gy", "Gz", "Label"]
 
 print("Original data:")
-print(df.head())
+print(df["Label"].value_counts())
 
-# Remove missing values
-df = df.dropna()
-
-# Normalize sensor values (simple scaling)
 sensor_columns = ["Ax", "Ay", "Az", "Gx", "Gy", "Gz"]
 
 df[sensor_columns] = (df[sensor_columns] - df[sensor_columns].mean()) / df[sensor_columns].std()
 
-# Save cleaned dataset
-df.to_csv("gesture_data_cleaned.csv", index=False)
+# Save WITHOUT header to match the headerless format used in data_collection.py
+df.to_csv("gesture_data_cleaned.csv", index=False, header=False)
 
-print("\nCleaned data saved as gesture_data_cleaned.csv")
+print("Cleaned data saved to gesture_data_cleaned.csv")
+print("\nNormalized data preview:")
+print(df.head())

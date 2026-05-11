@@ -1,5 +1,4 @@
-#include <Arduino_LSM9DS1.h>
-
+#include <Arduino_BMI270_BMM150.h>
 
 void setup() {
   Serial.begin(115200);
@@ -22,7 +21,7 @@ void loop() {
     IMU.readAcceleration(ax, ay, az);
     IMU.readGyroscope(gx, gy, gz);
 
-    // Send clean formatted data (IMPORTANT for Python)
+    // send clean formatted data for Python
     Serial.print(ax); Serial.print(",");
     Serial.print(ay); Serial.print(",");
     Serial.print(az); Serial.print(",");
@@ -32,5 +31,5 @@ void loop() {
   }
 
 
-  delay(50); // Sampling rate ~20 Hz
+  delay(10); 
 }

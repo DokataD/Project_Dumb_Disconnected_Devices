@@ -1,7 +1,7 @@
 import serial
 import pandas as pd
 
-SERIAL_PORT = 'COM6'  
+SERIAL_PORT = 'COM9'  
 BAUD_RATE = 115200
 
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE)
