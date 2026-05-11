@@ -1,0 +1,5 @@
+# jupyter kernel
+.venv/
+
+# dataset
+data/

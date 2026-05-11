@@ -1,6 +1,6 @@
 # Camera_code
 
-**<p> This file contains code for camera. It's a backup for code that's been tested and works properly (mostly). Do NOT modify unless you are sure what you are doing. </p>**
+**<p> This file contains code for the camera. It's a backup for code that's been tested and works properly (mostly). Do NOT modify unless you are sure what you are doing. </p>**
 
 MainWindow.xaml.cs - Responsible for camera logic
 ```cs
