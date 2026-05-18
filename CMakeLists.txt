@@ -36,8 +36,17 @@ file(GLOB_RECURSE
         )
 
 
+<<<<<<< HEAD
 add_executable(SmartRobotCar ${SOURCE_FILES})
 
+=======
+add_executable(SmartRobotCar
+    main.cpp
+    motor/DEV_Config.c
+    motor/MotorDriver.c
+    motor/PCA9685.c
+)
+>>>>>>> c686f4f (Implemented BLE connection Arduino-Pico and car moves with serial monitor command imput)
 
 pico_set_program_name(SmartRobotCar "SmartRobotCar")
 pico_set_program_version(SmartRobotCar "0.1")
@@ -54,6 +63,7 @@ target_link_libraries(SmartRobotCar
 
 target_include_directories(SmartRobotCar PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/include
+  ${CMAKE_CURRENT_LIST_DIR}/include_motor/motor
 )
 
 
