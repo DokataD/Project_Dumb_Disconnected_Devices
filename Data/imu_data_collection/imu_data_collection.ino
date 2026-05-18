@@ -1,5 +1,7 @@
 #include <Arduino_BMI270_BMM150.h>
 
+#include <Arduino_BMI270_BMM150.h>
+
 void setup() {
   Serial.begin(115200);
 
