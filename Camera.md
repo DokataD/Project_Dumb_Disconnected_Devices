@@ -59,7 +59,6 @@ namespace Project_Camera
 
                 if (previousFrame != null)
                 {
-                    // Detect motion and draw bounding box
                     Rectangle motionRect = DetectMotion(previousFrame, currentFrame);
 
                     if (motionRect != Rectangle.Empty)
@@ -71,11 +70,9 @@ namespace Project_Camera
                     }
                 }
 
-                // Store current frame for next comparison
                 previousFrame?.Dispose();
                 previousFrame = (Bitmap)currentFrame.Clone();
 
-                // Convert to WPF image
                 using (MemoryStream ms = new MemoryStream())
                 {
                     currentFrame.Save(ms, System.Drawing.Imaging.ImageFormat.Bmp);
@@ -139,14 +136,12 @@ namespace Project_Camera
                 }
             }
 
-            // 🚨 Ignore noise / tiny movement
             if (motionPixelCount < minMotionPixels)
                 return Rectangle.Empty;
 
             int boxWidth = maxX - minX;
             int boxHeight = maxY - minY;
 
-            // 🚨 Ignore weird full-screen detection
             if (boxWidth > width * 0.9 && boxHeight > height * 0.9)
                 return Rectangle.Empty;
 
@@ -181,4 +176,142 @@ MainWindow.cs - Responsible for UI visual ratio
         <Image Name="CameraImage" Stretch="Uniform" />
     </Grid>
 </Window>
+```
+
+
+
+## Second version, using ESP32 camera connected with Wi-Fi
+
+```cs
+using System;
+using System.IO;
+using System.IO.Ports;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media.Imaging;
+
+namespace Project_Camera
+{
+    public partial class MainWindow : Window
+    {
+
+        private const string CameraUrl = "http://192.168.4.1/camera/image";
+
+        private readonly HttpClient httpClient = new HttpClient();
+
+        private CancellationTokenSource cameraTokenSource;
+
+        private SerialPort serialPort;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+
+            cameraTokenSource = new CancellationTokenSource();
+
+            Task.Run(() => CameraLoop(cameraTokenSource.Token));
+
+            try
+            {
+                serialPort = new SerialPort("COM8", 115200);
+
+                serialPort.DataReceived += SerialPort_DataReceived;
+
+                serialPort.Open();
+
+                MessageBox.Show("Serial connected");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Serial error: {ex.Message}");
+            }
+        }
+
+        private async Task CameraLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    string base64 = await httpClient.GetStringAsync(CameraUrl);
+
+                    byte[] imageBytes = Convert.FromBase64String(base64);
+
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            using (MemoryStream ms = new MemoryStream(imageBytes))
+                            {
+                                BitmapImage image = new BitmapImage();
+
+                                image.BeginInit();
+                                image.StreamSource = ms;
+                                image.CacheOption = BitmapCacheOption.OnLoad;
+                                image.EndInit();
+
+                                image.Freeze();
+
+                                CameraImage.Source = image;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Image decode error: " + ex.Message);
+                        }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Camera fetch error: " + ex.Message);
+                }
+
+                // ~10 FPS
+                await Task.Delay(100);
+            }
+        }
+
+        private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                string line = serialPort.ReadLine();
+
+                Console.WriteLine("SERIAL: " + line);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Serial read error: " + ex.Message);
+            }
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            try
+            {
+                cameraTokenSource?.Cancel();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (serialPort != null && serialPort.IsOpen)
+                {
+                    serialPort.Close();
+                }
+            }
+            catch
+            {
+            }
+
+            httpClient.Dispose();
+
+            base.OnClosed(e);
+        }
+    }
+}
 ```
