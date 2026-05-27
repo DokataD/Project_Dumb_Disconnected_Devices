@@ -1,7 +1,7 @@
 import serial
 import sqlite3
 
-SERIAL_PORT = "COM9"   # Change this if your Arduino uses another COM port
+SERIAL_PORT = "COM9"   
 BAUD_RATE = 115200
 DATABASE_NAME = "gesture_database.db"
 
