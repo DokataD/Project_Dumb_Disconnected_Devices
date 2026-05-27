@@ -1,0 +1,5 @@
+# you can do this yourself
+preprocessed/
+
+# cahce folder
+__pycache__/

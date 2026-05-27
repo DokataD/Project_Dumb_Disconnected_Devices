@@ -25,12 +25,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-INPUT_DIR = "raw"
-OUTPUT_DIR = "preprocessed"
+INPUT_DIR      = "raw"
+OUTPUT_DIR     = "preprocessed"
+THRESHOLD_BIAS = 40
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
-THRESHOLD_BIAS = 40
 
 # ── core pipeline ────────────────────────────────────────────────────────────
 
@@ -84,7 +84,9 @@ def preprocess(src_path: Path, dst_path: Path) -> None:
         binary    = otsu_threshold(equalized, bias=THRESHOLD_BIAS)
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(binary).save(dst_path)
+        # always save as PNG — JPEG is lossy and corrupts the binary image
+        dst_path = dst_path.with_suffix(".png")
+        Image.fromarray(binary).save(dst_path, format="PNG")
 
 
 # ── dataset walker ───────────────────────────────────────────────────────────
@@ -110,8 +112,8 @@ def process_dataset(input_dir: str, output_dir: str) -> None:
             if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
         ]
         ok, err = 0, 0
-        for src in images:
-            dst = output_root / category.name / src.name
+        for ok, src in enumerate(images):
+            dst = output_root / category.name / f"{category.name}_{ok:02d}{src.suffix}"
             try:
                 preprocess(src, dst)
                 ok += 1
