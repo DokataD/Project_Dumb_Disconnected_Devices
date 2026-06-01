@@ -1,21 +1,28 @@
 import serial
 import sqlite3
 
-SERIAL_PORT = "COM9"   # Change if needed
+SERIAL_PORT = "COM9"   
 BAUD_RATE = 115200
+DATABASE_NAME = "gesture_database.db"
 
-label = input("Enter gesture label (e.g., left/right/up/down/circle/stay): ")
+label = input("Enter gesture label (left/right/up/down/circle/stay): ")
 
-conn = sqlite3.connect("gesture_database.db")
+conn = sqlite3.connect(DATABASE_NAME)
 cursor = conn.cursor()
 
-cursor.execute(
-    "INSERT INTO gesture_sessions (label) VALUES (?)",
-    (label,)
-)
+# Insert gesture label if it does not already exist
+cursor.execute("""
+INSERT OR IGNORE INTO gestures (label)
+VALUES (?)
+""", (label,))
 
-session_id = cursor.lastrowid
-conn.commit()
+# Get gesture_id for selected label
+cursor.execute("""
+SELECT gesture_id FROM gestures
+WHERE label = ?
+""", (label,))
+
+gesture_id = cursor.fetchone()[0]
 
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE)
 
@@ -32,10 +39,10 @@ try:
             ax, ay, az, gx, gy, gz = map(float, values)
 
             cursor.execute("""
-                INSERT INTO gesture_samples
-                (session_id, ax, ay, az, gx, gy, gz)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, ax, ay, az, gx, gy, gz))
+            INSERT INTO gesture_samples
+            (gesture_id, ax, ay, az, gx, gy, gz)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (gesture_id, ax, ay, az, gx, gy, gz))
 
             conn.commit()
 
