@@ -1,92 +1,39 @@
-"""
-Preprocess hand gesture images:
-  1. Grayscale
-  2. Resize to 64x64
-  3. Histogram equalization  (normalize lighting)
-  4. Otsu thresholding       (isolate hand from background)
-
-SENSITIVITY:
-  THRESHOLD_BIAS shifts the auto-computed Otsu threshold.
-  Range: -127 to +127
-    0   = pure Otsu (default)
-    +N  = higher threshold → less sensitive, ignores more bright background
-    -N  = lower threshold  → more sensitive, keeps more detail
-
-Input structure:
-  input_folder/
-    category1/  category2/  ...
-
-Output structure:
-  output_folder/
-    category1/  category2/  ...
-"""
-
 from pathlib import Path
-import numpy as np
 from PIL import Image
+import numpy as np
+import cv2
 
-INPUT_DIR      = "raw"
-OUTPUT_DIR     = "preprocessed"
-THRESHOLD_BIAS = 40
-
+INPUT_DIR            = "raw"
+OUTPUT_DIR           = "preprocessed"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
-
-# ── core pipeline ────────────────────────────────────────────────────────────
-
-def histogram_equalize(gray: np.ndarray) -> np.ndarray:
-    hist, _ = np.histogram(gray.flatten(), bins=256, range=(0, 256))
-    cdf = hist.cumsum()
-    cdf_min = cdf[cdf > 0].min()
-    total = gray.size
-    lut = np.round((cdf - cdf_min) / (total - cdf_min) * 255).astype(np.uint8)
-    return lut[gray]
-
-
-def otsu_threshold(gray: np.ndarray, bias: int = 0) -> np.ndarray:
-    """
-    Compute Otsu's optimal threshold, apply bias, then binarize.
-      bias > 0 → raise threshold → suppress bright background elements
-      bias < 0 → lower threshold → keep more dim detail
-    """
-    hist, _ = np.histogram(gray.flatten(), bins=256, range=(0, 256))
-    total = gray.size
-    total_sum = np.dot(np.arange(256), hist)
-
-    best_thresh, best_var = 0, 0.0
-    bg_weight, bg_sum = 0.0, 0.0
-
-    for t in range(256):
-        bg_weight += hist[t]
-        if bg_weight == 0:
-            continue
-        fg_weight = total - bg_weight
-        if fg_weight == 0:
-            break
-
-        bg_sum += t * hist[t]
-        bg_mean = bg_sum / bg_weight
-        fg_mean = (total_sum - bg_sum) / fg_weight
-
-        between_var = bg_weight * fg_weight * (bg_mean - fg_mean) ** 2
-        if between_var > best_var:
-            best_var = between_var
-            best_thresh = t
-
-    final_thresh = int(np.clip(best_thresh + bias, 0, 255))
-    return np.where(gray >= final_thresh, 255, 0).astype(np.uint8)
-
+# Default skin color range in HSV
+lower_skin = np.array([0,  20, 70],  dtype=np.uint8)
+upper_skin = np.array([20, 255, 255], dtype=np.uint8)
 
 def preprocess(src_path: Path, dst_path: Path) -> None:
-    with Image.open(src_path) as img:
-        gray      = np.array(img.convert("L").resize((64, 64), Image.LANCZOS))
-        equalized = histogram_equalize(gray)
-        binary    = otsu_threshold(equalized, bias=THRESHOLD_BIAS)
+    # Convert to HSV
+    frame = np.array(Image.open(src_path).convert("RGB"))
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        # always save as PNG — JPEG is lossy and corrupts the binary image
-        dst_path = dst_path.with_suffix(".png")
-        Image.fromarray(binary).save(dst_path, format="PNG")
+    # Create skin mask
+    mask = cv2.inRange(hsv, lower_skin, upper_skin)
+
+    # Clean up
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask   = cv2.dilate(mask, kernel, iterations=2)
+
+    # Resize to 96x96
+    small   = cv2.resize(mask, (96, 96))
+    display = cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST)
+    
+    # Save as PNG
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    dst_path = dst_path.with_suffix(".png")
+    Image.fromarray(display).save(dst_path, format="PNG")
 
 
 # ── dataset walker ───────────────────────────────────────────────────────────
@@ -103,7 +50,6 @@ def process_dataset(input_dir: str, output_dir: str) -> None:
         print("No category subfolders found.")
         return
 
-    print(f"Threshold bias: {THRESHOLD_BIAS:+d}\n")
     total_ok, total_err = 0, 0
 
     for category in category_dirs:

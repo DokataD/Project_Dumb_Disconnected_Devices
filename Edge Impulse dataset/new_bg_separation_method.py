@@ -3,15 +3,36 @@ import numpy as np
 import urllib.request
 import time
 
-ESP32_CAPTURE_URL = "http://172.20.10.8/capture"
+MJPEG = True
 
 def grab_frame():
-    try:
-        with urllib.request.urlopen(ESP32_CAPTURE_URL, timeout=10) as resp:
-            img_array = np.frombuffer(resp.read(), dtype=np.uint8)
-            return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    except:
-        return None
+    if MJPEG:
+        ESP32_CAPTURE_URL = "http://145.76.19.73/mjpeg/1"
+        try:
+            stream = urllib.request.urlopen(ESP32_CAPTURE_URL, timeout=10)
+            buffer = b""
+            while True:
+                buffer += stream.read(4096)
+                # JPEG frames start with FFD8 and end with FFD9
+                start = buffer.find(b'\xff\xd8')
+                end   = buffer.find(b'\xff\xd9')
+                if start != -1 and end != -1 and end > start:
+                    jpg = buffer[start:end+2]
+                    buffer = buffer[end+2:]
+                    img_array = np.frombuffer(jpg, dtype=np.uint8)
+                    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        return frame
+        except:
+            return None
+    else:
+        ESP32_CAPTURE_URL = "http://172.20.10.8/capture"
+        try:
+            with urllib.request.urlopen(ESP32_CAPTURE_URL, timeout=10) as resp:
+                img_array = np.frombuffer(resp.read(), dtype=np.uint8)
+                return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        except:
+            return None
 
 print("Testing connection...")
 frame = None
