@@ -27,13 +27,12 @@ def preprocess(src_path: Path, dst_path: Path) -> None:
     mask   = cv2.dilate(mask, kernel, iterations=2)
 
     # Resize to 96x96
-    small   = cv2.resize(mask, (96, 96))
-    display = cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST)
+    image  = cv2.resize(mask, (96, 96), interpolation=cv2.INTER_NEAREST)
     
     # Save as PNG
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     dst_path = dst_path.with_suffix(".png")
-    Image.fromarray(display).save(dst_path, format="PNG")
+    Image.fromarray(image).save(dst_path, format="PNG")
 
 
 # ── dataset walker ───────────────────────────────────────────────────────────

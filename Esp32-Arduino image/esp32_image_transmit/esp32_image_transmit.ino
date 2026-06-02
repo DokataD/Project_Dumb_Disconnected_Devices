@@ -20,14 +20,14 @@
 
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
-#include "home_wifi_multi.h"   // # put network credentials here
+#include "home_wifi_multi.h"      // # put network credentials here
 
 #define CAM_UART_TX      14       // to Arduino UART RX
 #define CAM_UART_RX      15       // to Arduino UART TX
 #define UART_BAUD        115200   // Fastest reliable baud rate
 
 // might influence frame corruption, test 150 ms
-#define FRAME_INTERVAL_MS  500
+#define FRAME_INTERVAL_MS  150
 
 static const uint8_t FRAME_START[2] = { 0xFF, 0xAA };
 static const uint8_t FRAME_END[2]   = { 0xFF, 0xBB };
@@ -58,9 +58,9 @@ bool initCamera() {
   config.xclk_freq_hz  = 20000000;
   config.pixel_format  = PIXFORMAT_JPEG;
 
-  // FRAMESIZE_QQVGA (160x120) is tested and stable, FRAMESIZE_96X96 (96x96) migth work
+  // FRAMESIZE_QQVGA (160x120) is tested and stable, FRAMESIZE_96X96 causes framebuffer overflow (FB-OVF)
   config.frame_size    = FRAMESIZE_QQVGA;
-  config.jpeg_quality  = 20; // must be at least 20, was main cause of decoding error 
+  config.jpeg_quality  = 20;  // must be at least 20, was main cause of decoding error 
   config.fb_count      = 1;   // 1 buffer must return it before getting next
   config.fb_location   = CAMERA_FB_IN_PSRAM;
   config.grab_mode = CAMERA_GRAB_LATEST;
@@ -149,7 +149,7 @@ void setup() {
   }
   Serial.println("Camera OK");
 
-  // WiFi - try for 10 seconds, disable wifi if fails
+  // WiFi - try 10 seconds, disable wifi if fails
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID1, PWD1);
   unsigned long t = millis();
@@ -185,6 +185,7 @@ void loop() {
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
+      // Debug check lenght
       Serial.print("Sending frame: ");
       Serial.println(fb->len);
       
