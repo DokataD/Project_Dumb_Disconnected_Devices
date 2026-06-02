@@ -1,47 +1,17 @@
-"""
-serial_preview.py — Live viewer for preprocessed frames streamed from Arduino.
-
-Request-response model: Python requests each frame individually,
-so the Arduino always captures fresh and the serial buffer never fills up.
-
-Controls:
-  Q / ESC     quit
-  S           save snapshot to ./snapshots/
-
-Dependencies:
-  pip install pyserial opencv-python numpy
-
-Usage:
-  python serial_preview.py              # auto-detects first Arduino port
-  python serial_preview.py COM3         # Windows
-  python serial_preview.py /dev/ttyACM0 # Linux / Mac
-"""
-
 import sys
-import os
 import time
 import numpy as np
 import cv2
 import serial
 import serial.tools.list_ports
 
-# ── settings ────────────────────────────────────────────────────────────────
-BAUD_RATE     = 2000000  # must match gesture_stream.ino
-FRAME_W       = 64
-FRAME_H       = 64
-FRAME_SZ      = FRAME_W * FRAME_H
-DISPLAY_SCALE = 8        # 64 × 8 = 512px window
-SNAPSHOT_DIR  = "snapshots"
-BIAS_STEP     = 5        # must match gesture_stream.ino
-
+BAUD_RATE   = 115200
 FRAME_START = bytes([0xFF, 0xAA])
 FRAME_END   = bytes([0xFF, 0xBB])
+DISPLAY_SZ  = 256 
 
-DISPLAY_W = FRAME_W * DISPLAY_SCALE
-DISPLAY_H = FRAME_H * DISPLAY_SCALE
-
-
-# ── port detection ───────────────────────────────────────────────────────────
+lower_skin = np.array([0,  20, 70],  dtype=np.uint8)
+upper_skin = np.array([20, 255, 255], dtype=np.uint8)
 
 def find_arduino_port() -> str:
     ports = serial.tools.list_ports.comports()
@@ -54,111 +24,53 @@ def find_arduino_port() -> str:
         return ports[0].device
     raise RuntimeError("No serial port found.")
 
+def request_frame(ser):
+    length_bytes = ser.read(4)
 
-# ── frame request / receive ──────────────────────────────────────────────────
+    if len(length_bytes) != 4:
+        return None
 
-def send_bias(ser: serial.Serial, direction: str) -> int | None:
-    """Send '+' or '-' to Arduino, return the confirmed bias value."""
-    ser.reset_input_buffer()
-    ser.write(direction.encode())
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        line = ser.readline().decode(errors="ignore").strip()
-        if line.startswith("BIAS:"):
-            try:
-                return int(line.split(":")[1])
-            except ValueError:
-                pass
-    return None
+    frame_len = int.from_bytes(length_bytes, "little")
 
+    jpg = ser.read(frame_len)
 
-def request_frame(ser: serial.Serial) -> tuple[np.ndarray | None, str, float]:
-    """
-    Request one frame + inference result.
-    Returns (frame_array, label, score) or (None, "", 0.0) on failure.
-    """
-    ser.reset_input_buffer()
-    ser.write(b'f')
+    if len(jpg) != frame_len:
+        return None
 
-    # wait for start marker
-    buf = b""
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        byte = ser.read(1)
-        if not byte:
-            continue
-        buf = (buf + byte)[-2:]
-        if buf == FRAME_START:
-            break
-    else:
-        return None, "", 0.0
+    frame = cv2.imdecode(
+        np.frombuffer(jpg, np.uint8),
+        cv2.IMREAD_COLOR
+    )
 
-    data = ser.read(FRAME_SZ)
-    if len(data) != FRAME_SZ:
-        return None, "", 0.0
+    return frame
 
-    end = ser.read(2)
-    if end != FRAME_END:
-        return None, "", 0.0
+def preprocess(frame):
+    # Convert to HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    frame = np.frombuffer(data, dtype=np.uint8).reshape((FRAME_H, FRAME_W))
+    # Create skin mask
+    mask = cv2.inRange(hsv, lower_skin, upper_skin)
 
-    # read the LABEL line that follows the frame
-    label, score = "…", 0.0
-    try:
-        line = ser.readline().decode(errors="ignore").strip()
-        if line.startswith("LABEL:"):
-            parts = line.split(",")
-            label = parts[0].split(":")[1]
-            score = float(parts[1].split(":")[1])
-    except (IndexError, ValueError):
-        pass
+    # Clean up
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask   = cv2.dilate(mask, kernel, iterations=2)
 
-    return frame, label, score
+    # Resize to 96x96
+    image  = cv2.resize(mask, (96, 96))
 
-
-# ── overlay ──────────────────────────────────────────────────────────────────
-
-def draw_overlay(canvas: np.ndarray, fps: float, port: str,
-                 bias: int, label: str, score: float) -> None:
-    font  = cv2.FONT_HERSHEY_SIMPLEX
-    green = (0, 255, 0)
-    lines = [
-        f"FPS: {fps:.1f}",
-        f"Port: {port}  @{BAUD_RATE//1000}k baud",
-        f"Res: {FRAME_W}x{FRAME_H}  (x{DISPLAY_SCALE})",
-        f"Bias: {bias:+d}  (UP/DOWN to adjust)",
-        "S: snapshot   Q/ESC: quit",
-    ]
-    for i, text in enumerate(lines):
-        y = 24 + i * 26
-        cv2.putText(canvas, text, (10, y), font, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(canvas, text, (10, y), font, 0.65, green,     1, cv2.LINE_AA)
-
-    # large label + score at the bottom
-    bar_w = int(score * (DISPLAY_W - 20))
-    cv2.rectangle(canvas, (10, DISPLAY_H - 36), (10 + bar_w, DISPLAY_H - 16),
-                  (0, 200, 0), -1)
-    cv2.rectangle(canvas, (10, DISPLAY_H - 36), (DISPLAY_W - 10, DISPLAY_H - 16),
-                  green, 1)
-    label_text = f"{label}  {score*100:.1f}%"
-    cv2.putText(canvas, label_text, (10, DISPLAY_H - 44),
-                font, 1.0, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(canvas, label_text, (10, DISPLAY_H - 44),
-                font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-
-
-# ── main ─────────────────────────────────────────────────────────────────────
+    return image
 
 def main() -> None:
     port = sys.argv[1] if len(sys.argv) > 1 else find_arduino_port()
-    print(f"Connecting to {port} at {BAUD_RATE} baud …")
+    print(f"Connecting to {port} at {BAUD_RATE} baud rate.")
 
     ser = serial.Serial(port, BAUD_RATE, timeout=2)
     ser.reset_input_buffer()
 
     # wait for Arduino ready signal
-    print("Waiting for Arduino … ", end="", flush=True)
+    print("Waiting for Arduino ... ", end="", flush=True)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="ignore").strip()
@@ -166,55 +78,49 @@ def main() -> None:
             break
     print("ready.")
 
-    prev_time  = time.time()
-    fps        = 0.0
-    snapshot_n = 0
-    bias       = 20   # must match BIAS_DEFAULT in gesture_stream.ino
-    label      = "…"
-    score      = 0.0
-
-    print("Streaming.  UP/DOWN to adjust bias, Q/ESC to quit, S to snapshot.")
-
     while True:
-        frame, label, score = request_frame(ser)
+        frame = request_frame(ser)
+
         if frame is None:
-            print("Frame timeout — retrying …")
+            print("DECODE FAILED")
             continue
 
-        display = cv2.resize(frame, (DISPLAY_W, DISPLAY_H),
-                             interpolation=cv2.INTER_NEAREST)
-        canvas  = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+        mask = preprocess(frame)
 
-        now       = time.time()
-        fps       = 0.9 * fps + 0.1 / max(now - prev_time, 1e-6)
-        prev_time = now
+        masked_display = cv2.resize(mask, (320, 320), interpolation=cv2.INTER_NEAREST)
+        frame_display = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_NEAREST)
 
-        draw_overlay(canvas, fps, port, bias, label, score)
-        cv2.imshow("Arduino Gesture Stream  |  Q to quit", canvas)
+        if len(masked_display.shape) == 2:
+            masked_display = cv2.cvtColor(masked_display, cv2.COLOR_GRAY2BGR)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
+        if len(frame_display.shape) == 2:
+            frame_display = cv2.cvtColor(frame_display, cv2.COLOR_GRAY2BGR)
+
+        combined = np.hstack((masked_display, frame_display))
+
+        cv2.imshow("ESP32-CAM", combined)
+
+        key = cv2.waitKey(1)
+        if key == ord('q') or key == 27:
             break
-        elif key == ord("s"):
-            os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-            path = os.path.join(SNAPSHOT_DIR, f"snap_{snapshot_n:04d}.png")
-            cv2.imwrite(path, canvas)
-            snapshot_n += 1
-            print(f"Saved {path}")
-        elif key in (82, 0):    # UP arrow
-            confirmed = send_bias(ser, '+')
-            if confirmed is not None:
-                bias = confirmed
-                print(f"bias → {bias:+d}")
-        elif key in (84, 1):    # DOWN arrow
-            confirmed = send_bias(ser, '-')
-            if confirmed is not None:
-                bias = confirmed
-                print(f"bias → {bias:+d}")
-
-    ser.close()
-    cv2.destroyAllWindows()
-
+        elif key == ord('s'):
+            # Sample skin color from center of frame
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            roi = hsv[cy-20:cy+20, cx-20:cx+20]
+            mean_hsv = cv2.mean(roi)[:3]
+            lower_skin = np.array([
+                max(0,   mean_hsv[0] - 10),
+                max(0,   mean_hsv[1] - 40),
+                max(0,   mean_hsv[2] - 60)
+            ], dtype=np.uint8)
+            upper_skin = np.array([
+                min(179, mean_hsv[0] + 10),
+                255,
+                255
+            ], dtype=np.uint8)
+            print(f"HSV range: {lower_skin} - {upper_skin}")
 
 if __name__ == "__main__":
     main()

@@ -26,7 +26,7 @@ def grab_frame():
         except:
             return None
     else:
-        ESP32_CAPTURE_URL = "http://172.20.10.8/capture"
+        ESP32_CAPTURE_URL = "http://145.76.19.73/capture"
         try:
             with urllib.request.urlopen(ESP32_CAPTURE_URL, timeout=10) as resp:
                 img_array = np.frombuffer(resp.read(), dtype=np.uint8)
