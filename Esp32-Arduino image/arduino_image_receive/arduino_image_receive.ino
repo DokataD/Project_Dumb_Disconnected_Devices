@@ -3,7 +3,7 @@
   
   Wiring:
     ESP32-CAM GPIO14  -->  Arduino Nano 33 BLE RX (pin 0)
-    [ESP32-CAM GPIO15  -->  Arduino Nano 33 BLE TX (pin 1)] -- unused
+    [ESP32-CAM GPIO15  -->  Arduino Nano 33 BLE TX (pin 1)]
     Common GND
 
   Frame protocol:
@@ -14,13 +14,15 @@
 */
 
 #include <Arduino.h>
+// Jpeg decoding to RGB 565
 #include <JPEGDEC.h>
+// Edge impulse inference library
 #include <image_recognition_inferencing.h>
 
 #define CAM_BAUD          115200  // must be the same as camera baud rate
-#define REQ_BYTE          0x52   // 'R'
-#define FRAME_TIMEOUT_MS  2000
-#define SERIAL_DEBUG      true
+#define REQ_BYTE          0x52    // 'R' - signal when ready to receive
+#define FRAME_TIMEOUT_MS  2000    // try again if camera doesn't send frame
+#define SERIAL_DEBUG      true    // True: Send debug image to Serial - False: run classifier and print result
 
 enum RxState {
   WAIT_START_1,   // Looking for 0xFF
@@ -34,38 +36,43 @@ enum RxState {
   WAIT_END_2      // Looking for 0xBB
 };
 
-static RxState  rxState   = WAIT_START_1;
-static uint32_t frameLen  = 0;
-static uint32_t lastFrameLen = 0;
-static uint32_t bytesRead = 0;
-static bool     frameReady = false;
+static RxState  rxState       = WAIT_START_1;
+static uint32_t frameLen      = 0;
+static uint32_t lastFrameLen  = 0;
+static uint32_t bytesRead     = 0;
+static bool     frameReady    = false;
 
-#define SRC_W     160     // JPEG coming in from ESP32-CAM
-#define SRC_H     120
+#define SRC_W     160     // ESP32-CAM JPEG stream size - Width
+#define SRC_H     120     // ESP32-CAM JPEG stream size - Height
 
-#define DST_W     64      // target size for inference
-#define DST_H     64
+#define DST_W     64      // Resize target after preprocessing and classifier input size
+#define DST_H     64      // Resize target after preprocessing and classifier input size
 
-#define BUTTON_PIN 4 
+#define BUTTON_PIN 4      // Skin hue sample button
 bool HSV_button = false;
 
-uint8_t H_LO = 0, H_HI = 20;
+// default hue values, resample with button press
+uint8_t H_LO =  0, H_HI =  20;
 uint8_t S_LO = 20, S_HI = 255;
 uint8_t V_LO = 70, V_HI = 255;
 
+// Maximum received frame size: 4 KB
 #define MAX_FRAME_SIZE  4096
 
+// Start and END bytes to mark the image borders from the ESP32-CAM
 #define START_B1  0xFF
 #define START_B2  0xAA
 #define END_B1    0xFF
 #define END_B2    0xBB
 
-static uint8_t  frameBuf[MAX_FRAME_SIZE];       // raw JPEG from UART
+static uint8_t  frameBuf[MAX_FRAME_SIZE];       // raw JPEG from ESP32-CAM
 static uint16_t decodeBuf[SRC_W * SRC_H];       // decoded RGB565 160×120
 static float    pixelBuf[DST_W * DST_H];        // final 64x64 float mask
 
+// JPEG decoder
 JPEGDEC jpeg;
 
+// Preprocessing: raw JPEG -> decoded RGB565 
 int jpegDrawCallback(JPEGDRAW *pDraw) {
   uint16_t *src = pDraw->pPixels;
   for (int row = 0; row < pDraw->iHeight; row++) {
@@ -80,6 +87,7 @@ int jpegDrawCallback(JPEGDRAW *pDraw) {
   return 1;
 }
 
+// Preprocessing: RGB565 -> HSV mask
 void rgb565ToHSV(uint16_t rgb565, uint8_t &h, uint8_t &s, uint8_t &v) {
   float r = ( rgb565 >> 11)         * (1.0f / 31.0f);
   float g = ((rgb565 >>  5) & 0x3F) * (1.0f / 63.0f);
@@ -91,11 +99,9 @@ void rgb565ToHSV(uint16_t rgb565, uint8_t &h, uint8_t &s, uint8_t &v) {
 
   // Value
   v = (uint8_t)(cmax * 255.0f);
-
   // Saturation
   s = (cmax > 0.0f) ? (uint8_t)((delta / cmax) * 255.0f) : 0;
-
-  // Hue (0–180, matching OpenCV)
+  // Hue
   float hf = 0.0f;
   if (delta > 1e-6f) {
     if      (cmax == r) hf = 30.0f * fmodf((g - b) / delta, 6.0f);
@@ -106,6 +112,7 @@ void rgb565ToHSV(uint16_t rgb565, uint8_t &h, uint8_t &s, uint8_t &v) {
   h = (uint8_t)hf;
 }
 
+// Preprocessing: RGB565, HSV image -> 64x64 mask
 void resizeAndMask() {
   for (int y = 0; y < DST_H; y++) {
     int srcY = (int)(y * SRC_H / (float)DST_H);
@@ -118,58 +125,57 @@ void resizeAndMask() {
       uint8_t h, s, v;
       rgb565ToHSV(decodeBuf[srcY * SRC_W + srcX], h, s, v);
 
-      bool inRange = (h >= H_LO && h <= H_HI &&
-                      s >= S_LO && s <= S_HI &&
-                      v >= V_LO && v <= V_HI);
+      bool inRange = (h >= H_LO && h <= H_HI && s >= S_LO && s <= S_HI && v >= V_LO && v <= V_HI);
 
       pixelBuf[y * DST_W + x] = inRange ? 1.0f : 0.0f;
     }
   }
 }
 
-void calibrateSkin()
-{
-    const int cx = SRC_W / 2;
-    const int cy = SRC_H / 2;
+// On button press, adjust HSV values to range from current image
+void calibrateSkin() {
+  // Sample box in center of the image
+  const int cx = SRC_W / 2;
+  const int cy = SRC_H / 2;
+  const int radius = 10;
 
-    const int radius = 10; // 20x20 sample box
+  uint32_t hSum = 0;
+  uint32_t sSum = 0;
+  uint32_t vSum = 0;
+  uint32_t count = 0;
 
-    uint32_t hSum = 0;
-    uint32_t sSum = 0;
-    uint32_t vSum = 0;
-    uint32_t count = 0;
+  for (int y = cy - radius; y <= cy + radius; y++) {
+    for (int x = cx - radius; x <= cx + radius; x++) {
+      uint8_t h, s, v;
+      rgb565ToHSV(decodeBuf[y * SRC_W + x], h, s, v);
 
-    for (int y = cy - radius; y <= cy + radius; y++) {
-        for (int x = cx - radius; x <= cx + radius; x++) {
-            uint8_t h, s, v;
-            rgb565ToHSV(decodeBuf[y * SRC_W + x], h, s, v);
-
-            hSum += h;
-            sSum += s;
-            vSum += v;
-            count++;
-        }
+      hSum += h;
+      sSum += s;
+      vSum += v;
+      count++;
     }
+  }
 
-    uint8_t hMean = hSum / count;
-    uint8_t sMean = sSum / count;
-    uint8_t vMean = vSum / count;
+  uint8_t hMean = hSum / count;
+  uint8_t sMean = sSum / count;
+  uint8_t vMean = vSum / count;
 
-    // Tunable margins
-    const int H_MARGIN = 12;
-    const int S_MARGIN = 50;
-    const int V_MARGIN = 50;
+  // Tunable margins
+  const int H_MARGIN = 12;
+  const int S_MARGIN = 50;
+  const int V_MARGIN = 50;
 
-    H_LO = max(0,   (int)hMean - H_MARGIN);
-    H_HI = min(180, (int)hMean + H_MARGIN);
+  H_LO = max(0,   (int)hMean - H_MARGIN);
+  H_HI = min(180, (int)hMean + H_MARGIN);
 
-    S_LO = max(0,   (int)sMean - S_MARGIN);
-    S_HI = min(255, (int)sMean + S_MARGIN);
+  S_LO = max(0,   (int)sMean - S_MARGIN);
+  S_HI = min(255, (int)sMean + S_MARGIN);
 
-    V_LO = max(0,   (int)vMean - V_MARGIN);
-    V_HI = min(255, (int)vMean + V_MARGIN);
+  V_LO = max(0,   (int)vMean - V_MARGIN);
+  V_HI = min(255, (int)vMean + V_MARGIN);
 }
 
+// If SERIAL_DEBUG is enabled it sends preprocessed images trough Serial
 void sendToSerial() {
   uint32_t count = DST_W * DST_H;
 
@@ -182,7 +188,7 @@ void sendToSerial() {
   
 void processFrame(const uint8_t *data, uint32_t len) {
   Serial.print(len);
-  // 1. Decode JPEG → decodeBuf (160×120 RGB565)
+  // Decode JPEG
   if (!jpeg.openRAM((uint8_t *)data, (int)len, jpegDrawCallback)) {
     Serial.println("JPEGDEC openRAM failed");
     return;
@@ -194,8 +200,10 @@ void processFrame(const uint8_t *data, uint32_t len) {
   }
   jpeg.close();
 
+  // Apply preprocessing
   resizeAndMask();
 
+  // If SERIAL_DEBUG is enabled it sends preprocessed images trough Serial else run classifier and print result
   if (SERIAL_DEBUG) {
     sendToSerial();
   } else {
@@ -220,32 +228,43 @@ void processFrame(const uint8_t *data, uint32_t len) {
   }
 }
 
+// frame done or corrupt, restart request process
 void resetRx() {
   rxState   = WAIT_START_1;
   frameLen  = 0;
   bytesRead = 0;
 }
 
+// Send request byte to ESP32-CAM to signal ready for new frame
 void requestFrame() {
-  Serial1.flush();          // make sure TX is empty before sending
+  // make sure TX is empty before sending
+  Serial1.flush();
+  // Reset receiving state 
   resetRx();
-  while (Serial1.available()) Serial1.read();   // drain any stale RX bytes
+  // drain any stale RX bytes
+  while (Serial1.available()) Serial1.read();
+  // Send request byte
   Serial1.write(REQ_BYTE);
 }
 
+// Read ESP32-CAM stream
 bool drainUART() {
+  // Receive until stream stops
   while (Serial1.available()) {
     uint8_t b = Serial1.read();
-    switch (rxState)
-    {
+    
+    switch (rxState) {
+      // Check for Frame Start first byte
       case WAIT_START_1:
         if (b == START_B1) rxState = WAIT_START_2;
         break;
+      // Check for Frame Start second byte
       case WAIT_START_2:
         if      (b == START_B2) { rxState = READ_LEN_0; frameLen = bytesRead = 0; }
         else if (b == START_B1)   rxState = WAIT_START_2;
         else                      rxState = WAIT_START_1;
         break;
+      // Read frame lenght from Most- to Least Significant Bit
       case READ_LEN_0: frameLen  = ((uint32_t)b << 24); rxState = READ_LEN_1; break;
       case READ_LEN_1: frameLen |= ((uint32_t)b << 16); rxState = READ_LEN_2; break;
       case READ_LEN_2: frameLen |= ((uint32_t)b <<  8); rxState = READ_LEN_3; break;
@@ -254,18 +273,22 @@ bool drainUART() {
         if (frameLen == 0 || frameLen > MAX_FRAME_SIZE) { resetRx(); }
         else rxState = READ_PAYLOAD;
         break;
+      // All checks complete, start receiving image data
       case READ_PAYLOAD:
         frameBuf[bytesRead++] = b;
         if (bytesRead >= frameLen) rxState = WAIT_END_1;
         break;
+      // Frame end byte received or ran out of frame space, check which is the case
       case WAIT_END_1:
         rxState = (b == END_B1) ? WAIT_END_2 : WAIT_START_1;
         break;
+      // Frame end first byte was received, check for Frame end second byte
       case WAIT_END_2:
         lastFrameLen = frameLen;
         resetRx();
         if (b == END_B2) return true;   // complete valid frame
         break;
+      // Unhandled state, restart
       default: resetRx(); break;
     }
   }
@@ -273,11 +296,13 @@ bool drainUART() {
 }
 
 void setup() {
-  Serial.begin(115200);     // Writing image
-  Serial1.begin(CAM_BAUD);  // Reading image
+  Serial.begin(115200);     // Serial:  Writing image
+  Serial1.begin(CAM_BAUD);  // Serial1: Reading image
 
+  // Sample button setup
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  // Request first frame from ESP32-CAM
   Serial.println("RDY");
   requestFrame();
 }
@@ -285,23 +310,20 @@ void setup() {
 void loop() {
   static unsigned long requestTime = millis();
 
+  // Read Sample button
   static bool lastButton = HIGH;
-
   bool button = digitalRead(BUTTON_PIN);
-
   if (lastButton == HIGH && button == LOW) calibrateSkin();
-
   lastButton = button;
 
   if (drainUART()) {
-    // Complete frame received — process it
+    // Complete frame received, process it
     processFrame(frameBuf, lastFrameLen);
-
     // Request next frame immediately after processing
     requestFrame();
     requestTime = millis();
   } else if (millis() - requestTime > FRAME_TIMEOUT_MS) {
-    // No frame arrived in time - resend request
+    // No frame arrived in time, request again
     Serial.println("Frame request timeout");
     requestFrame();
     requestTime = millis();

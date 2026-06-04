@@ -3,7 +3,7 @@
 
   Wiring:
     ESP32-CAM GPIO14  -->  Arduino Nano 33 BLE RX (pin 0)
-    [ESP32-CAM GPIO15  -->  Arduino Nano 33 BLE TX (pin 1)] -- unused
+    [ESP32-CAM GPIO15  -->  Arduino Nano 33 BLE TX (pin 1)]
     Common GND
 
   Frame protocol:
@@ -20,16 +20,14 @@
 
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
-#include "home_wifi_multi.h"      // # put network credentials here
+#include "home_wifi_multi.h"      // put network credentials here
 
 #define CAM_UART_TX      14       // to Arduino UART RX
 #define CAM_UART_RX      15       // to Arduino UART TX
 #define UART_BAUD        115200   // Fastest reliable baud rate
-#define REQ_BYTE      0x52  // 'R'
+#define REQ_BYTE         0x52     // 'R' - Arduino signal when ready to receive
 
-// might influence frame corruption, test 150 ms
-#define FRAME_INTERVAL_MS  150
-
+// Start and END bytes to mark the image borders to Arduino
 static const uint8_t FRAME_START[2] = { 0xFF, 0xAA };
 static const uint8_t FRAME_END[2]   = { 0xFF, 0xBB };
 
@@ -61,8 +59,8 @@ bool initCamera() {
 
   // FRAMESIZE_QQVGA (160x120) is tested and stable, FRAMESIZE_96X96 causes framebuffer overflow (FB-OVF)
   config.frame_size    = FRAMESIZE_QQVGA;
-  config.jpeg_quality  = 20;  // must be at least 20, was main cause of decoding error 
-  config.fb_count      = 1;   // 1 buffer must return it before getting next
+  config.jpeg_quality  = 20;  // must be at least 20, was main cause of decoding error
+  config.fb_count      = 1;   // 1 buffer, multiple causes framebuffer overflow (FB-OVF)
   config.fb_location   = CAMERA_FB_IN_PSRAM;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
@@ -74,6 +72,7 @@ bool initCamera() {
   return true;
 }
 
+// Transmit to Arduino: Start byte - Image data - End byte
 void sendFrameUART(const uint8_t *data, uint32_t len) {
   Serial2.write(FRAME_START, 2);
 
@@ -93,12 +92,14 @@ void sendFrameUART(const uint8_t *data, uint32_t len) {
   Serial2.flush();
 }
 
+// Triggered when receives request byte ['R']
 void handleFrameRequest() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("fb_get failed");
     return;
   }
+  // Transmit to Arduino
   sendFrameUART(fb->buf, fb->len);
   esp_camera_fb_return(fb);
 }
@@ -110,6 +111,7 @@ const char HEADER[]   = "HTTP/1.1 200 OK\r\n"
 const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
 const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
 
+// Wifi streaming function
 void handle_jpg_stream() {
   char buf[32];
   WiFiClient client = server.client();
@@ -130,6 +132,7 @@ void handle_jpg_stream() {
   }
 }
 
+// Wifi streaming function
 void handle_jpg() {
   WiFiClient client = server.client();
   if (!client.connected()) return;
@@ -146,6 +149,7 @@ void handle_jpg() {
   esp_camera_fb_return(fb);
 }
 
+// Wifi streaming function
 void handleNotFound() {
   server.send(200, "text/plain", "ESP32-CAM running");
 }
@@ -164,8 +168,9 @@ void setup() {
   }
   Serial.println("Camera OK");
 
-  // WiFi - try 10 seconds, disable wifi if fails
+  // WiFi - try for 10 seconds, disable wifi streaming if it fails
   WiFi.mode(WIFI_STA);
+  // credentials from home_wifi_multi.h
   WiFi.begin(SSID1, PWD1);
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
@@ -176,7 +181,7 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
-    Serial.print("WiFi OK  IP: ");
+    Serial.print("WiFi OK - IP: ");
     Serial.println(WiFi.localIP());
     server.on("/mjpeg/1", HTTP_GET, handle_jpg_stream);
     server.on("/jpg",     HTTP_GET, handle_jpg);
@@ -192,6 +197,7 @@ void setup() {
 }
 
 void loop() {
+  // Send feed trough pins [GPIO 14 - 15]
   if (Serial2.available()) {
     uint8_t b = Serial2.read();
     if (b == REQ_BYTE) {
@@ -199,6 +205,7 @@ void loop() {
     }
   }
 
+  // Stream to local network if available
   if (wifiOk) {
     server.handleClient();
   }
