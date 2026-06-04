@@ -14,16 +14,13 @@
 */
 
 #include <Arduino.h>
+#include <JPEGDEC.h>
+#include <image_recognition_inferencing.h>
 
-#define CAM_BAUD  115200  // must be the same as camera baud rate
-
-#define START_B1  0xFF
-#define START_B2  0xAA
-#define END_B1    0xFF
-#define END_B2    0xBB
-
-#define MAX_FRAME_SIZE  32768  // 32 KB max
-static uint8_t frameBuf[MAX_FRAME_SIZE];
+#define CAM_BAUD          115200  // must be the same as camera baud rate
+#define REQ_BYTE          0x52   // 'R'
+#define FRAME_TIMEOUT_MS  2000
+#define SERIAL_DEBUG      true
 
 enum RxState {
   WAIT_START_1,   // Looking for 0xFF
@@ -37,105 +34,276 @@ enum RxState {
   WAIT_END_2      // Looking for 0xBB
 };
 
-static RxState   state      = WAIT_START_1;
-static uint32_t  frameLen   = 0;
-static uint32_t  bytesRead  = 0;
+static RxState  rxState   = WAIT_START_1;
+static uint32_t frameLen  = 0;
+static uint32_t lastFrameLen = 0;
+static uint32_t bytesRead = 0;
+static bool     frameReady = false;
 
-void onFrameReceived(const uint8_t *data, uint32_t len) {
-  
-  // add preprocessing here
+#define SRC_W     160     // JPEG coming in from ESP32-CAM
+#define SRC_H     120
 
-  // Debug
-  /*
-  Serial.print("Frame OK  len=");
-  Serial.print(len);
-  Serial.print("  header=0x");
-  if (len >= 2) {
-    Serial.print(data[0], HEX);
-    Serial.print(data[1], HEX);
+#define DST_W     64      // target size for inference
+#define DST_H     64
+
+#define BUTTON_PIN 4 
+bool HSV_button = false;
+
+uint8_t H_LO = 0, H_HI = 20;
+uint8_t S_LO = 20, S_HI = 255;
+uint8_t V_LO = 70, V_HI = 255;
+
+#define MAX_FRAME_SIZE  4096
+
+#define START_B1  0xFF
+#define START_B2  0xAA
+#define END_B1    0xFF
+#define END_B2    0xBB
+
+static uint8_t  frameBuf[MAX_FRAME_SIZE];       // raw JPEG from UART
+static uint16_t decodeBuf[SRC_W * SRC_H];       // decoded RGB565 160×120
+static float    pixelBuf[DST_W * DST_H];        // final 64x64 float mask
+
+JPEGDEC jpeg;
+
+int jpegDrawCallback(JPEGDRAW *pDraw) {
+  uint16_t *src = pDraw->pPixels;
+  for (int row = 0; row < pDraw->iHeight; row++) {
+    int y = pDraw->y + row;
+    if (y >= SRC_H) break;
+    for (int col = 0; col < pDraw->iWidth; col++) {
+      int x = pDraw->x + col;
+      if (x >= SRC_W) break;
+      decodeBuf[y * SRC_W + x] = src[row * pDraw->iWidth + col];
+    }
   }
-  Serial.println();
-  */
+  return 1;
+}
 
-  // forward raw JPEG bytes trough Serial
-  Serial.write((uint8_t*)&len, sizeof(len));
-  Serial.write(data, len);
+void rgb565ToHSV(uint16_t rgb565, uint8_t &h, uint8_t &s, uint8_t &v) {
+  float r = ( rgb565 >> 11)         * (1.0f / 31.0f);
+  float g = ((rgb565 >>  5) & 0x3F) * (1.0f / 63.0f);
+  float b = ( rgb565        & 0x1F) * (1.0f / 31.0f);
+
+  float cmax  = max(r, max(g, b));
+  float cmin  = min(r, min(g, b));
+  float delta = cmax - cmin;
+
+  // Value
+  v = (uint8_t)(cmax * 255.0f);
+
+  // Saturation
+  s = (cmax > 0.0f) ? (uint8_t)((delta / cmax) * 255.0f) : 0;
+
+  // Hue (0–180, matching OpenCV)
+  float hf = 0.0f;
+  if (delta > 1e-6f) {
+    if      (cmax == r) hf = 30.0f * fmodf((g - b) / delta, 6.0f);
+    else if (cmax == g) hf = 30.0f * ((b - r) / delta + 2.0f);
+    else                hf = 30.0f * ((r - g) / delta + 4.0f);
+    if (hf < 0.0f) hf += 180.0f;
+  }
+  h = (uint8_t)hf;
+}
+
+void resizeAndMask() {
+  for (int y = 0; y < DST_H; y++) {
+    int srcY = (int)(y * SRC_H / (float)DST_H);
+    if (srcY >= SRC_H) srcY = SRC_H - 1;
+
+    for (int x = 0; x < DST_W; x++) {
+      int srcX = (int)(x * SRC_W / (float)DST_W);
+      if (srcX >= SRC_W) srcX = SRC_W - 1;
+
+      uint8_t h, s, v;
+      rgb565ToHSV(decodeBuf[srcY * SRC_W + srcX], h, s, v);
+
+      bool inRange = (h >= H_LO && h <= H_HI &&
+                      s >= S_LO && s <= S_HI &&
+                      v >= V_LO && v <= V_HI);
+
+      pixelBuf[y * DST_W + x] = inRange ? 1.0f : 0.0f;
+    }
+  }
+}
+
+void calibrateSkin()
+{
+    const int cx = SRC_W / 2;
+    const int cy = SRC_H / 2;
+
+    const int radius = 10; // 20x20 sample box
+
+    uint32_t hSum = 0;
+    uint32_t sSum = 0;
+    uint32_t vSum = 0;
+    uint32_t count = 0;
+
+    for (int y = cy - radius; y <= cy + radius; y++) {
+        for (int x = cx - radius; x <= cx + radius; x++) {
+            uint8_t h, s, v;
+            rgb565ToHSV(decodeBuf[y * SRC_W + x], h, s, v);
+
+            hSum += h;
+            sSum += s;
+            vSum += v;
+            count++;
+        }
+    }
+
+    uint8_t hMean = hSum / count;
+    uint8_t sMean = sSum / count;
+    uint8_t vMean = vSum / count;
+
+    // Tunable margins
+    const int H_MARGIN = 12;
+    const int S_MARGIN = 50;
+    const int V_MARGIN = 50;
+
+    H_LO = max(0,   (int)hMean - H_MARGIN);
+    H_HI = min(180, (int)hMean + H_MARGIN);
+
+    S_LO = max(0,   (int)sMean - S_MARGIN);
+    S_HI = min(255, (int)sMean + S_MARGIN);
+
+    V_LO = max(0,   (int)vMean - V_MARGIN);
+    V_HI = min(255, (int)vMean + V_MARGIN);
+}
+
+void sendToSerial() {
+  uint32_t count = DST_W * DST_H;
+
+  Serial.write(0xAA);
+  Serial.write(0x55);
+
+  Serial.write((uint8_t*)&count, sizeof(count));
+  Serial.write((uint8_t*)pixelBuf, count * sizeof(float));
+}
+  
+void processFrame(const uint8_t *data, uint32_t len) {
+  Serial.print(len);
+  // 1. Decode JPEG → decodeBuf (160×120 RGB565)
+  if (!jpeg.openRAM((uint8_t *)data, (int)len, jpegDrawCallback)) {
+    Serial.println("JPEGDEC openRAM failed");
+    return;
+  }
+  if (!jpeg.decode(0, 0, 0)) {
+    Serial.println("JPEGDEC decode failed");
+    jpeg.close();
+    return;
+  }
+  jpeg.close();
+
+  resizeAndMask();
+
+  if (SERIAL_DEBUG) {
+    sendToSerial();
+  } else {
+    signal_t signal;
+    numpy::signal_from_buffer(pixelBuf, DST_W * DST_H, &signal);
+    ei_impulse_result_t result;
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+    if (err != EI_IMPULSE_OK) {
+      Serial.print("Classifier error: "); Serial.println(err);
+    } else {
+      // Print all labels and scores
+      for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        Serial.print(result.classification[i].label);
+        Serial.print(": ");
+        Serial.print(result.classification[i].value, 4);
+        Serial.print("   ");
+      }
+      Serial.println();
+      Serial.print("Highest result: ");
+      Serial.println(result.classification[0].label);
+    }
+  }
+}
+
+void resetRx() {
+  rxState   = WAIT_START_1;
+  frameLen  = 0;
+  bytesRead = 0;
+}
+
+void requestFrame() {
+  Serial1.flush();          // make sure TX is empty before sending
+  resetRx();
+  while (Serial1.available()) Serial1.read();   // drain any stale RX bytes
+  Serial1.write(REQ_BYTE);
+}
+
+bool drainUART() {
+  while (Serial1.available()) {
+    uint8_t b = Serial1.read();
+    switch (rxState)
+    {
+      case WAIT_START_1:
+        if (b == START_B1) rxState = WAIT_START_2;
+        break;
+      case WAIT_START_2:
+        if      (b == START_B2) { rxState = READ_LEN_0; frameLen = bytesRead = 0; }
+        else if (b == START_B1)   rxState = WAIT_START_2;
+        else                      rxState = WAIT_START_1;
+        break;
+      case READ_LEN_0: frameLen  = ((uint32_t)b << 24); rxState = READ_LEN_1; break;
+      case READ_LEN_1: frameLen |= ((uint32_t)b << 16); rxState = READ_LEN_2; break;
+      case READ_LEN_2: frameLen |= ((uint32_t)b <<  8); rxState = READ_LEN_3; break;
+      case READ_LEN_3:
+        frameLen |= b;
+        if (frameLen == 0 || frameLen > MAX_FRAME_SIZE) { resetRx(); }
+        else rxState = READ_PAYLOAD;
+        break;
+      case READ_PAYLOAD:
+        frameBuf[bytesRead++] = b;
+        if (bytesRead >= frameLen) rxState = WAIT_END_1;
+        break;
+      case WAIT_END_1:
+        rxState = (b == END_B1) ? WAIT_END_2 : WAIT_START_1;
+        break;
+      case WAIT_END_2:
+        lastFrameLen = frameLen;
+        resetRx();
+        if (b == END_B2) return true;   // complete valid frame
+        break;
+      default: resetRx(); break;
+    }
+  }
+  return false;
 }
 
 void setup() {
   Serial.begin(115200);     // Writing image
   Serial1.begin(CAM_BAUD);  // Reading image
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Serial.println("RDY");
+  requestFrame();
 }
 
 void loop() {
-  while (Serial1.available()) {
-    uint8_t b = Serial1.read();
+  static unsigned long requestTime = millis();
 
-    switch (state) {
-      // Waiting for start marker byte 1
-      case WAIT_START_1:
-        if (b == START_B1) state = WAIT_START_2;
-        break;
+  static bool lastButton = HIGH;
 
-      // Waiting for start marker byte 2
-      case WAIT_START_2:
-        if (b == START_B2) {
-          state     = READ_LEN_0;
-          frameLen  = 0;
-          bytesRead = 0;
-        } else {
-          // False alarm
-          state = (b == START_B1) ? WAIT_START_2 : WAIT_START_1;
-        }
-        break;
+  bool button = digitalRead(BUTTON_PIN);
 
-      // Read 4-byte big-endian length
-      case READ_LEN_0: frameLen  = ((uint32_t)b << 24); state = READ_LEN_1; break;
-      case READ_LEN_1: frameLen |= ((uint32_t)b << 16); state = READ_LEN_2; break;
-      case READ_LEN_2: frameLen |= ((uint32_t)b <<  8); state = READ_LEN_3; break;
-      case READ_LEN_3:
-        frameLen |= b;
+  if (lastButton == HIGH && button == LOW) calibrateSkin();
 
-        if (frameLen == 0 || frameLen > MAX_FRAME_SIZE) {
-          // Corrupt length
-          Serial.print("Bad frame length: ");
-          Serial.println(frameLen);
-          state = WAIT_START_1;
-        } else {
-          state = READ_PAYLOAD;
-        }
-        break;
+  lastButton = button;
 
-      // Accumulate JPEG payload
-      case READ_PAYLOAD:
-        frameBuf[bytesRead++] = b;
-        if (bytesRead >= frameLen) state = WAIT_END_1;
-        break;
+  if (drainUART()) {
+    // Complete frame received — process it
+    processFrame(frameBuf, lastFrameLen);
 
-      // Verify end marker
-      case WAIT_END_1:
-        if (b == END_B1) {
-          state = WAIT_END_2;
-        } else {
-          Serial.println("Missing end marker byte 1 - discarding frame");
-          Serial.print("Expected FF, got ");
-          Serial.println(b, HEX);
-          state = WAIT_START_1;
-        }
-        break;
-
-      case WAIT_END_2:
-        if (b == END_B2) {
-          onFrameReceived(frameBuf, frameLen);
-        } else {
-          Serial.println("Missing end marker byte 2 - discarding frame");
-        }
-        state = WAIT_START_1;
-        break;
-
-      default:
-        state = WAIT_START_1;
-        break;
-    }
+    // Request next frame immediately after processing
+    requestFrame();
+    requestTime = millis();
+  } else if (millis() - requestTime > FRAME_TIMEOUT_MS) {
+    // No frame arrived in time - resend request
+    Serial.println("Frame request timeout");
+    requestFrame();
+    requestTime = millis();
   }
 }

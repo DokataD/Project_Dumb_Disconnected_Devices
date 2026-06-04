@@ -6,14 +6,18 @@ import cv2
 INPUT_DIR            = "raw"
 OUTPUT_DIR           = "preprocessed"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+IMAGE_SIZE           = 64
 
 # Default skin color range in HSV
-lower_skin = np.array([0,  20, 70],  dtype=np.uint8)
+lower_skin = np.array([0,  20, 70], dtype=np.uint8)
 upper_skin = np.array([20, 255, 255], dtype=np.uint8)
 
 def preprocess(src_path: Path, dst_path: Path) -> None:
-    # Convert to HSV
+    # Resize to 64x64
     frame = np.array(Image.open(src_path).convert("RGB"))
+    frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
+    
+    # Convert to HSV
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -25,15 +29,11 @@ def preprocess(src_path: Path, dst_path: Path) -> None:
     mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask   = cv2.dilate(mask, kernel, iterations=2)
-
-    # Resize to 96x96
-    image  = cv2.resize(mask, (96, 96), interpolation=cv2.INTER_NEAREST)
     
     # Save as PNG
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     dst_path = dst_path.with_suffix(".png")
-    Image.fromarray(image).save(dst_path, format="PNG")
-
+    Image.fromarray(mask).save(dst_path, format="PNG")
 
 # ── dataset walker ───────────────────────────────────────────────────────────
 

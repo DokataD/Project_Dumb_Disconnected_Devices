@@ -25,6 +25,7 @@
 #define CAM_UART_TX      14       // to Arduino UART RX
 #define CAM_UART_RX      15       // to Arduino UART TX
 #define UART_BAUD        115200   // Fastest reliable baud rate
+#define REQ_BYTE      0x52  // 'R'
 
 // might influence frame corruption, test 150 ms
 #define FRAME_INTERVAL_MS  150
@@ -32,7 +33,7 @@
 static const uint8_t FRAME_START[2] = { 0xFF, 0xAA };
 static const uint8_t FRAME_END[2]   = { 0xFF, 0xBB };
 
-WebServer server(80);
+WebServer server(80); 
 bool wifiOk = false;
 
 bool initCamera() {
@@ -82,10 +83,24 @@ void sendFrameUART(const uint8_t *data, uint32_t len) {
     (uint8_t)(len >>  8),
     (uint8_t)(len      )
   };
+  
+  Serial.print("Sending frame: ");
+  Serial.println(len);
+  
   Serial2.write(lenBuf, 4);
   Serial2.write(data, len);
   Serial2.write(FRAME_END, 2);
   Serial2.flush();
+}
+
+void handleFrameRequest() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("fb_get failed");
+    return;
+  }
+  sendFrameUART(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
 }
 
 const char HEADER[]   = "HTTP/1.1 200 OK\r\n"
@@ -139,12 +154,12 @@ void setup() {
   setCpuFrequencyMhz(80);
 
   Serial.begin(115200);
-  Serial.println("ESP32-CAM booting...");
+  Serial.println("ESP32-CAM booting ...");
 
   Serial2.begin(UART_BAUD, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
 
   if (!initCamera()) {
-    Serial.println("Camera failed — halting");
+    Serial.println("Camera failed - halting");
     while (true) delay(1000);
   }
   Serial.println("Camera OK");
@@ -168,31 +183,19 @@ void setup() {
     server.onNotFound(handleNotFound);
     server.begin();
   } else {
-    Serial.println("WiFi failed — UART only");
+    Serial.println("WiFi failed - UART only");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
   }
 
-  Serial.println("Running — sending frames on GPIO14");
+  Serial.println("Running - sending frames on GPIO14");
 }
 
 void loop() {
-  static unsigned long lastFrame = 0;
-  unsigned long now = millis();
-
-  if (now - lastFrame >= FRAME_INTERVAL_MS) {
-    lastFrame = now;
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) {
-      // Debug check lenght
-      Serial.print("Sending frame: ");
-      Serial.println(fb->len);
-      
-      sendFrameUART(fb->buf, fb->len);
-      esp_camera_fb_return(fb);
-    } else {
-      Serial.println("fb_get failed");
+  if (Serial2.available()) {
+    uint8_t b = Serial2.read();
+    if (b == REQ_BYTE) {
+      handleFrameRequest();
     }
   }
 
