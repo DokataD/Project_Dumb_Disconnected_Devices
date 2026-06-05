@@ -14,9 +14,13 @@
 */
 
 #include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClient.h>
 
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
+#include "home_wifi_multi.h"      // put network credentials here
 
 #define CAM_UART_TX      14       // to Arduino UART RX
 #define CAM_UART_RX      15       // to Arduino UART TX
@@ -26,6 +30,9 @@
 // Start and END bytes to mark the image borders to Arduino
 static const uint8_t FRAME_START[2] = { 0xFF, 0xAA };
 static const uint8_t FRAME_END[2]   = { 0xFF, 0xBB };
+
+WebServer server(80); 
+bool wifiOk = false;
 
 bool initCamera() {
   camera_config_t config;
@@ -48,11 +55,10 @@ bool initCamera() {
   config.pin_pwdn      = PWDN_GPIO_NUM;
   config.pin_reset     = RESET_GPIO_NUM;
   config.xclk_freq_hz  = 20000000;
-  // this camera doesnt support jpeg
-  config.pixel_format  = PIXFORMAT_RGB565;
+  config.pixel_format  = PIXFORMAT_JPEG;
 
-  // FRAMESIZE_96X96 works with RGB565
-  config.frame_size    = FRAMESIZE_96X96;
+  // FRAMESIZE_QQVGA (160x120) is tested and stable, FRAMESIZE_96X96 causes framebuffer overflow (FB-OVF)
+  config.frame_size    = FRAMESIZE_QQVGA;
   config.jpeg_quality  = 20;  // must be at least 20, was main cause of decoding error
   config.fb_count      = 1;   // 1 buffer, multiple causes framebuffer overflow (FB-OVF)
   config.fb_location   = CAMERA_FB_IN_PSRAM;
@@ -86,7 +92,7 @@ void sendFrameUART(const uint8_t *data, uint32_t len) {
   Serial2.flush();
 }
 
-// Triggered when receives request byte 'R'
+// Triggered when receives request byte ['R']
 void handleFrameRequest() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -96,6 +102,56 @@ void handleFrameRequest() {
   // Transmit to Arduino
   sendFrameUART(fb->buf, fb->len);
   esp_camera_fb_return(fb);
+}
+
+const char HEADER[]   = "HTTP/1.1 200 OK\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Content-Type: multipart/x-mixed-replace; "
+                        "boundary=123456789000000000000987654321\r\n";
+const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
+const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
+
+// Wifi streaming function
+void handle_jpg_stream() {
+  char buf[32];
+  WiFiClient client = server.client();
+  client.write(HEADER, strlen(HEADER));
+  client.write(BOUNDARY, strlen(BOUNDARY));
+
+  while (client.connected()) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { delay(10); continue; }
+
+    client.write(CTNTTYPE, strlen(CTNTTYPE));
+    sprintf(buf, "%d\r\n\r\n", fb->len);
+    client.write(buf, strlen(buf));
+    client.write((char *)fb->buf, fb->len);
+    client.write(BOUNDARY, strlen(BOUNDARY));
+
+    esp_camera_fb_return(fb);
+  }
+}
+
+// Wifi streaming function
+void handle_jpg() {
+  WiFiClient client = server.client();
+  if (!client.connected()) return;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  const char jheader[] = "HTTP/1.1 200 OK\r\n"
+                         "Content-disposition: inline; filename=capture.jpg\r\n"
+                         "Content-type: image/jpeg\r\n\r\n";
+  client.write(jheader, strlen(jheader));
+  client.write((char *)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+}
+
+// Wifi streaming function
+void handleNotFound() {
+  server.send(200, "text/plain", "ESP32-CAM running");
 }
 
 void setup() {
@@ -111,14 +167,46 @@ void setup() {
     while (true) delay(1000);
   }
   Serial.println("Camera OK");
+
+  // WiFi - try for 10 seconds, disable wifi streaming if it fails
+  WiFi.mode(WIFI_STA);
+  // credentials from home_wifi_multi.h
+  WiFi.begin(SSID1, PWD1);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiOk = true;
+    Serial.print("WiFi OK - IP: ");
+    Serial.println(WiFi.localIP());
+    server.on("/mjpeg/1", HTTP_GET, handle_jpg_stream);
+    server.on("/jpg",     HTTP_GET, handle_jpg);
+    server.onNotFound(handleNotFound);
+    server.begin();
+  } else {
+    Serial.println("WiFi failed - UART only");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+
   Serial.println("Running - sending frames on GPIO14");
 }
 
 void loop() {
+  // Send feed trough pins [GPIO 14 - 15]
   if (Serial2.available()) {
     uint8_t b = Serial2.read();
     if (b == REQ_BYTE) {
       handleFrameRequest();
     }
+  }
+
+  // Stream to local network if available
+  if (wifiOk) {
+    server.handleClient();
   }
 }

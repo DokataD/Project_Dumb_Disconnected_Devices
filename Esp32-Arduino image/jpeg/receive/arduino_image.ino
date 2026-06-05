@@ -16,13 +16,16 @@
 #include <Arduino.h>
 // Jpeg decoding to RGB 565
 #include <JPEGDEC.h>
+// Bluetooth Low Energy
+#include <ArduinoBLE.h>
 // Edge impulse inference library
 #include <image_recognition_inferencing.h>
 
-#define CAM_BAUD          115200  // must be the same as camera baud rate
+
+#define CAM_BAUD          230400  // must be the same as camera baud rate
+#define FRAME_BAUD        230400
 #define REQ_BYTE          0x52    // 'R' - signal when ready to receive
 #define FRAME_TIMEOUT_MS  2000    // try again if camera doesn't send frame
-#define SERIAL_DEBUG      true    // True: Send debug image to Serial - False: run classifier and print result
 
 enum RxState {
   WAIT_START_1,   // Looking for 0xFF
@@ -52,9 +55,22 @@ static bool     frameReady    = false;
 bool HSV_button = false;
 
 // default hue values, resample with button press
-uint8_t H_LO =  0, H_HI =  20;
-uint8_t S_LO = 20, S_HI = 255;
-uint8_t V_LO = 70, V_HI = 255;
+uint8_t H_LO =   0, H_HI =  25;
+uint8_t S_LO =  15, S_HI = 255;
+uint8_t V_LO =  40, V_HI = 255;
+
+uint8_t H_LO_READ =   0, H_HI_READ =  25;
+uint8_t S_LO_READ =  15, S_HI_READ = 255;
+uint8_t V_LO_READ =  40, V_HI_READ = 255;
+
+BLEService carService("19B10000-E8F2-537E-4F6C-D104768A1214");
+
+BLEByteCharacteristic commandCharacteristic(
+  "19B10001-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify
+);
+
+const char* labels[] = {"go", "left", "right", "stop", "reverse"};
 
 // Maximum received frame size: 4 KB
 #define MAX_FRAME_SIZE  4096
@@ -72,7 +88,7 @@ static float    pixelBuf[DST_W * DST_H];        // final 64x64 float mask
 // JPEG decoder
 JPEGDEC jpeg;
 
-// Preprocessing: raw JPEG -> decoded RGB565 
+// Preprocessing: raw JPEG -> decoded RGB565
 int jpegDrawCallback(JPEGDRAW *pDraw) {
   uint16_t *src = pDraw->pPixels;
   for (int row = 0; row < pDraw->iHeight; row++) {
@@ -104,15 +120,15 @@ void rgb565ToHSV(uint16_t rgb565, uint8_t &h, uint8_t &s, uint8_t &v) {
   // Hue
   float hf = 0.0f;
   if (delta > 1e-6f) {
-    if      (cmax == r) hf = 30.0f * fmodf((g - b) / delta, 6.0f);
-    else if (cmax == g) hf = 30.0f * ((b - r) / delta + 2.0f);
-    else                hf = 30.0f * ((r - g) / delta + 4.0f);
+    if      (cmax == r) hf = 60.0f * fmodf((g - b) / delta, 6.0f);
+    else if (cmax == g) hf = 60.0f * ((b - r) / delta + 2.0f);
+    else                hf = 60.0f * ((r - g) / delta + 4.0f);
     if (hf < 0.0f) hf += 180.0f;
   }
-  h = (uint8_t)hf;
+  h = (uint8_t)(hf / 2.0f);
 }
 
-// Preprocessing: RGB565, HSV image -> 64x64 mask
+// Preprocessing: HSV 96x96 -> float mask 64x64
 void resizeAndMask() {
   for (int y = 0; y < DST_H; y++) {
     int srcY = (int)(y * SRC_H / (float)DST_H);
@@ -127,13 +143,12 @@ void resizeAndMask() {
 
       bool inRange = (h >= H_LO && h <= H_HI && s >= S_LO && s <= S_HI && v >= V_LO && v <= V_HI);
 
-      pixelBuf[y * DST_W + x] = inRange ? 1.0f : 0.0f;
+      pixelBuf[y * DST_W + x] = inRange ? 255.0f : 0.0f;
     }
   }
 }
 
-// On button press, adjust HSV values to range from current image
-void calibrateSkin() {
+void readHSV(bool calibrate = false) {
   // Sample box in center of the image
   const int cx = SRC_W / 2;
   const int cy = SRC_H / 2;
@@ -160,34 +175,76 @@ void calibrateSkin() {
   uint8_t sMean = sSum / count;
   uint8_t vMean = vSum / count;
 
-  // Tunable margins
+    // Tunable margins
   const int H_MARGIN = 12;
   const int S_MARGIN = 50;
   const int V_MARGIN = 50;
 
-  H_LO = max(0,   (int)hMean - H_MARGIN);
-  H_HI = min(180, (int)hMean + H_MARGIN);
+  if (calibrate) {
+    H_LO = max(0,   (int)hMean - H_MARGIN);
+    H_HI = min(180, (int)hMean + H_MARGIN);
 
-  S_LO = max(0,   (int)sMean - S_MARGIN);
-  S_HI = min(255, (int)sMean + S_MARGIN);
+    S_LO = max(0,   (int)sMean - S_MARGIN);
+    S_HI = min(255, (int)sMean + S_MARGIN);
 
-  V_LO = max(0,   (int)vMean - V_MARGIN);
-  V_HI = min(255, (int)vMean + V_MARGIN);
+    V_LO = max(0,   (int)vMean - V_MARGIN);
+    V_HI = min(255, (int)vMean + V_MARGIN);
+  } else {
+    H_LO_READ = max(0,   (int)hMean - H_MARGIN);
+    H_HI_READ = min(180, (int)hMean + H_MARGIN);
+
+    S_LO_READ = max(0,   (int)sMean - S_MARGIN);
+    S_HI_READ = min(255, (int)sMean + S_MARGIN);
+
+    V_LO_READ = max(0,   (int)vMean - V_MARGIN);
+    V_HI_READ = min(255, (int)vMean + V_MARGIN);
+  }
 }
 
-// If SERIAL_DEBUG is enabled it sends preprocessed images trough Serial
-void sendToSerial() {
+// Sends packet: 0xAA | 0x55 | image data | number of classes | scores | index
+void sendToSerial(ei_impulse_result_t &result) {
   uint32_t count = DST_W * DST_H;
 
   Serial.write(0xAA);
   Serial.write(0x55);
 
+  // image size
   Serial.write((uint8_t*)&count, sizeof(count));
+  // image data
   Serial.write((uint8_t*)pixelBuf, count * sizeof(float));
+
+  // number of classes
+  uint8_t n = EI_CLASSIFIER_LABEL_COUNT;
+  Serial.write(n);
+
+  // send scores
+  for (size_t i = 0; i < n; i++) {
+    // score
+    float score = result.classification[i].value;
+    Serial.write((uint8_t*)&score, sizeof(float));
+    // index
+    uint8_t idx = i;
+    Serial.write(&idx, 1);
+  }
+
+  readHSV(false);
+  Serial.write((uint8_t*)&H_LO_READ, sizeof(uint8_t));
+  Serial.write((uint8_t*)&H_HI_READ, sizeof(uint8_t));
+  Serial.write((uint8_t*)&S_LO_READ, sizeof(uint8_t));
+  Serial.write((uint8_t*)&S_HI_READ, sizeof(uint8_t));
+  Serial.write((uint8_t*)&V_LO_READ, sizeof(uint8_t));
+  Serial.write((uint8_t*)&V_HI_READ, sizeof(uint8_t));
+}
+
+void signalPico(ei_impulse_result_t &result) {
+ for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    if (strcmp(result.classification[0].label, labels[i]) == 0) {
+      commandCharacteristic.writeValue((byte)i+1);
+    }
+  }
 }
   
 void processFrame(const uint8_t *data, uint32_t len) {
-  Serial.print(len);
   // Decode JPEG
   if (!jpeg.openRAM((uint8_t *)data, (int)len, jpegDrawCallback)) {
     Serial.println("JPEGDEC openRAM failed");
@@ -203,28 +260,18 @@ void processFrame(const uint8_t *data, uint32_t len) {
   // Apply preprocessing
   resizeAndMask();
 
-  // If SERIAL_DEBUG is enabled it sends preprocessed images trough Serial else run classifier and print result
-  if (SERIAL_DEBUG) {
-    sendToSerial();
+  // Run classifier
+  signal_t signal;
+  numpy::signal_from_buffer(pixelBuf, DST_W * DST_H, &signal);
+  ei_impulse_result_t result;
+  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+  
+  // If success, send image and scores trough Serial
+  if (err != EI_IMPULSE_OK) {
+    Serial.print("Classifier error: "); Serial.println(err);
   } else {
-    signal_t signal;
-    numpy::signal_from_buffer(pixelBuf, DST_W * DST_H, &signal);
-    ei_impulse_result_t result;
-    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
-    if (err != EI_IMPULSE_OK) {
-      Serial.print("Classifier error: "); Serial.println(err);
-    } else {
-      // Print all labels and scores
-      for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        Serial.print(result.classification[i].label);
-        Serial.print(": ");
-        Serial.print(result.classification[i].value, 4);
-        Serial.print("   ");
-      }
-      Serial.println();
-      Serial.print("Highest result: ");
-      Serial.println(result.classification[0].label);
-    }
+    sendToSerial(result);
+    signalPico(result);
   }
 }
 
@@ -295,26 +342,48 @@ bool drainUART() {
   return false;
 }
 
+void initBluetooth() {
+  if (!BLE.begin()) {
+    Serial.println("BLE failed!");
+    while (1);
+  }
+
+  BLE.setLocalName("NanoCarController");
+  BLE.setAdvertisedService(carService);
+  carService.addCharacteristic(commandCharacteristic);
+  BLE.addService(carService);
+  commandCharacteristic.writeValue((byte)'s');
+  BLE.advertise();
+}
+
 void setup() {
-  Serial.begin(115200);     // Serial:  Writing image
+  Serial.begin(FRAME_BAUD); // Serial:  Writing image
   Serial1.begin(CAM_BAUD);  // Serial1: Reading image
 
   // Sample button setup
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  initBluetooth();
 
   // Request first frame from ESP32-CAM
   Serial.println("RDY");
   requestFrame();
 }
 
+void readButton() {
+  static bool lastButton = HIGH;
+  bool button = digitalRead(BUTTON_PIN);
+  if (lastButton == HIGH && button == LOW) readHSV(true);
+  lastButton = button;
+}
+
 void loop() {
   static unsigned long requestTime = millis();
 
+  BLE.poll();
+
   // Read Sample button
-  static bool lastButton = HIGH;
-  bool button = digitalRead(BUTTON_PIN);
-  if (lastButton == HIGH && button == LOW) calibrateSkin();
-  lastButton = button;
+  readButton();
 
   if (drainUART()) {
     // Complete frame received, process it

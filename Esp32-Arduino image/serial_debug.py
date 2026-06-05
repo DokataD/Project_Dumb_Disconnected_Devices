@@ -10,6 +10,10 @@ COUNT = WIDTH * HEIGHT
 BAUD_RATE = 230400
 LABEL_NAMES = ["go", "left", "reverse", "right", "stop"]
 
+hue = (0, 25)
+sat = (15, 255)
+val = (40, 255)
+
 def find_arduino_port() -> str:
     ports = serial.tools.list_ports.comports()
     for p in ports:
@@ -65,7 +69,7 @@ while True:
     labels = []
     scores = []
 
-    # 5. read all labels
+    # 5. read hsv
     for _ in range(n_labels):
         score_bytes = ser.read(4)
         idx_bytes = ser.read(1)
@@ -81,6 +85,12 @@ while True:
 
     if len(scores) == 0:
         continue
+    
+    hue = (ser.read(1)[0], ser.read(1)[0])
+    sat = (ser.read(1)[0], ser.read(1)[0])
+    val = (ser.read(1)[0], ser.read(1)[0])
+
+    bluetooth_signal = ser.read(1)[0]
 
     # 6. best prediction
     best_i = int(np.argmax(scores))
@@ -96,7 +106,16 @@ while True:
         color = (0, 255, 0) if i == best_i else (0, 0, 255)
 
         cv2.putText(display, f"{label}: {score:.2f}", (10, 30 + i * 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    
+    cv2.putText(display, f"Hue: {hue[0]} - {hue[1]}", (150, 30), 
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(display, f"Sat: {sat[0]} - {sat[1]}", (150, 55), 
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(display, f"Val: {val[0]} - {val[1]}", (150, 80), 
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(display, f"BLE: {bluetooth_signal}", (150, 105), 
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
     cv2.imshow("frame", display)
 
