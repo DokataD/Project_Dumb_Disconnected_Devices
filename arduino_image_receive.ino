@@ -1,10 +1,24 @@
 #include <Arduino.h>
 #include <JPEGDEC.h>
+#include <ArduinoBLE.h>
 #include <image_recognition_v2_inferencing.h>
 
 #define CAM_BAUD 115200
 #define REQ_BYTE 0x52
 #define FRAME_TIMEOUT_MS 2000
+
+#define SERVICE_UUID "19B10000-E8F2-537E-4F6C-D104768A1214"
+#define CHARACTERISTIC_UUID "19B10001-E8F2-537E-4F6C-D104768A1214"
+BLEService carService(SERVICE_UUID);
+BLEByteCharacteristic commandChar(CHARACTERISTIC_UUID, BLERead | BLENotify);
+
+// ── Gesture logic tuning ──
+#define WINDOW 7       // sliding window size
+#define VOTE_NEEDED 5  // votes within window to confirm a command
+#define STOP_NEEDED 5  // "none" frames within window to auto-stop
+#define CONFIDENCE_THRESHOLD 0.70f
+#define MIN_SEND_INTERVAL_MS 1000  // at most one command per second
+#define SEND_DEBUG 1               // 1 = stream mask to viewer; 0 = faster driving
 
 #define SRC_W 160
 #define SRC_H 120
@@ -13,7 +27,7 @@
 #define NPIX (DST_W * DST_H)
 #define MAX_FRAME_SIZE 8192
 
-uint8_t H_LO = 0, H_HI = 30;
+uint8_t H_LO = 0, H_HI = 25;
 uint8_t S_LO = 20, S_HI = 255;
 uint8_t V_LO = 30, V_HI = 255;
 
@@ -39,6 +53,12 @@ static uint16_t decodeBuf[SRC_W * SRC_H];
 static uint8_t maskBuf[NPIX];
 static uint8_t tmpBuf[NPIX];
 static uint16_t flood_stack[NPIX];
+
+// ── Vote window ──
+char window[WINDOW] = { 0 };
+int widx = 0;
+char lastSent = 's';
+unsigned long lastSendTime = 0;
 
 JPEGDEC jpeg;
 
@@ -88,7 +108,6 @@ void buildMask() {
   }
 }
 
-// Gentle de-speckle: drop only isolated pixels (<2 white neighbours). Keeps fingers.
 void despeckle() {
   for (int i = 0; i < NPIX; i++) tmpBuf[i] = maskBuf[i];
   for (int y = 0; y < DST_H; y++)
@@ -192,11 +211,8 @@ void keepLargestBlob() {
   }
   for (int i = 0; i < NPIX; i++) maskBuf[i] = tmpBuf[i];
 }
-// Closing: dilate then erode — fills small holes and smooths edges
-
-// Closing: dilate then erode — fills small holes and smooths edges
 void closeOnce() {
-  // Dilate
+  // dilate
   for (int y = 0; y < DST_H; y++)
     for (int x = 0; x < DST_W; x++) {
       uint8_t v = maskBuf[y * DST_W + x];
@@ -205,7 +221,7 @@ void closeOnce() {
       }
       tmpBuf[y * DST_W + x] = v;
     }
-  // Erode back
+  // erode back
   for (int y = 0; y < DST_H; y++)
     for (int x = 0; x < DST_W; x++) {
       uint8_t v = tmpBuf[y * DST_W + x];
@@ -216,9 +232,8 @@ void closeOnce() {
     }
 }
 void cleanMask() {
-  despeckle();        // remove stray dots
+  despeckle();
   keepLargestBlob();
-  closeOnce();  // keep only the hand
 }
 
 int get_signal_data(size_t offset, size_t length, float *out) {
@@ -229,6 +244,7 @@ int get_signal_data(size_t offset, size_t length, float *out) {
   return 0;
 }
 
+#if SEND_DEBUG
 void sendDebug(const char *label, float conf) {
   Serial.write(0xAA);
   Serial.write(0x55);
@@ -239,6 +255,75 @@ void sendDebug(const char *label, float conf) {
   Serial.write(len);
   Serial.write((const uint8_t *)label, len);
   Serial.write((uint8_t *)&conf, 4);
+}
+#endif
+
+// forward->'1', left->'3', right->'4', stop->'s', back/unknown ignored
+char gestureToCommand(const char *label) {
+  if (!strcmp(label, "forward")) return '1';
+  if (!strcmp(label, "back")) return '2';
+  if (!strcmp(label, "left")) return '3';
+  if (!strcmp(label, "right")) return '4';
+  if (!strcmp(label, "stop")) return 's';
+  return 0;
+}
+
+void handleGesture(const char *label, float conf) {
+  // weak prediction or "back" -> treated as "none" (0)
+  char cmd = (conf >= CONFIDENCE_THRESHOLD) ? gestureToCommand(label) : 0;
+
+  window[widx] = cmd;
+  widx = (widx + 1) % WINDOW;
+
+  int c1 = 0, c2 = 0, c3 = 0, c4 = 0, cs = 0, cnone = 0;
+  for (int i = 0; i < WINDOW; i++) {
+    switch (window[i]) {
+      case '1': c1++; break;
+      case '2': c2++; break;
+      case '3': c3++; break;
+      case '4': c4++; break;
+      case 's': cs++; break;
+      default: cnone++; break;
+    }
+  }
+
+  char best = 0;
+  int bestc = 0;
+  if (c1 > bestc) {
+    bestc = c1;
+    best = '1';
+  }
+  if (c2 > bestc) {
+    bestc = c2;
+    best = '2';
+  }
+  if (c3 > bestc) {
+    bestc = c3;
+    best = '3';
+  }
+  if (c4 > bestc) {
+    bestc = c4;
+    best = '4';
+  }
+  if (cs > bestc) {
+    bestc = cs;
+    best = 's';
+  }
+
+  unsigned long now = millis();
+  if (bestc >= VOTE_NEEDED) {
+    if (best != lastSent && (now - lastSendTime) >= MIN_SEND_INTERVAL_MS) {
+      commandChar.writeValue((uint8_t)best);
+      lastSent = best;
+      lastSendTime = now;
+    }
+  } else if (cnone >= STOP_NEEDED) {
+    if (lastSent != 's') {  // auto-stop when hand is lost
+      commandChar.writeValue((uint8_t)'s');
+      lastSent = 's';
+      lastSendTime = now;
+    }
+  }
 }
 
 void processFrame(const uint8_t *data, uint32_t len) {
@@ -254,10 +339,7 @@ void processFrame(const uint8_t *data, uint32_t len) {
   signal.total_length = NPIX;
   signal.get_data = &get_signal_data;
   ei_impulse_result_t result;
-  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) {
-    sendDebug("err", 0);
-    return;
-  }
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) return;
   int best = 0;
   float bestv = 0;
   for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
@@ -266,7 +348,11 @@ void processFrame(const uint8_t *data, uint32_t len) {
       best = i;
     }
   }
-  sendDebug(ei_classifier_inferencing_categories[best], bestv);
+  const char *label = ei_classifier_inferencing_categories[best];
+#if SEND_DEBUG
+  sendDebug(label, bestv);
+#endif
+  handleGesture(label, bestv);
 }
 
 void resetRx() {
@@ -330,11 +416,24 @@ bool drainUART() {
 void setup() {
   Serial.begin(115200);
   Serial1.begin(CAM_BAUD);
+
+  if (!BLE.begin()) {
+    while (1)
+      ;
+  }
+  BLE.setLocalName("NanoCarController");
+  BLE.setAdvertisedService(carService);
+  carService.addCharacteristic(commandChar);
+  BLE.addService(carService);
+  commandChar.writeValue((uint8_t)'s');
+  BLE.advertise();
+
   requestFrame();
 }
 
 void loop() {
   static unsigned long t = millis();
+  BLE.poll();
   if (drainUART()) {
     processFrame(frameBuf, lastFrameLen);
     requestFrame();
